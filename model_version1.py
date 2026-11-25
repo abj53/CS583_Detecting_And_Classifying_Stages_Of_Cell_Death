@@ -1,51 +1,86 @@
-from pathlib import Path
+# assumes script is in the same dir as features/filtered images
+
+from __future__ import annotations
+import copy
 import random
 import re
-import zipfile
-from matplotlib import pyplot as plt
+from pathlib import Path
+from typing import Any
 import numpy as np
-import pandas as pd
-from PIL import Image
-from remotezip import RemoteZip
-import requests
-from scipy import ndimage as ndi
-from skimage import color, feature, filters, io, util
-import tifffile
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import models, transforms
 
 DEFAULT_CLASS_NAMES = ["blebbing", "disruption", "predeath"]
 DEFAULT_IMAGE_SIZE = (224, 224)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-CHECKPOINT_PATH = Path(__file__).resolve().parent / "stage_death_cnn.pt"
+
+
+def set_seed(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def has_excluded_tif_tif_name(path: Path) -> bool:
+    """Return True if the filename contains 'tif.tif' (case-insensitive)."""
+    return bool(re.search(r"tif\.tif", path.name, flags=re.IGNORECASE))
+
 
 def extract_cell_group_id_from_filename(path: Path) -> str:
-    """Extract `<video>_cell<num>` when present so frames from the same cell stay grouped."""
+    """Extract `<video>_cell<num>` so frames from the same cell stay grouped."""
     stem_clean = re.sub(r"(?:\.(?:tif|tiff|png))+$", "", path.stem, flags=re.IGNORECASE)
     match = re.match(r"^(?P<cell_id>.+?_cell\d+)", stem_clean, flags=re.IGNORECASE)
     if match:
         return match.group("cell_id").lower()
     return stem_clean.lower()
 
+
 def extract_class_name_from_filename(
     path: Path,
     allowed_classes: list[str] | None = None,
-    verbose: bool = False,
 ) -> str:
-    """Extract the target cell-death stage class name from a filename."""
+    """Extract target class name from filename."""
     classes = list(allowed_classes) if allowed_classes is not None else list(DEFAULT_CLASS_NAMES)
     stem_lower = path.stem.lower()
     for class_name in classes:
         if re.search(rf"(?:^|[_\-\s]){re.escape(class_name.lower())}(?:[_\-\s]|$)", stem_lower) or (
             class_name.lower() in stem_lower
         ):
-            if verbose:
-                print(f"Identified {class_name} from {path.name}")
             return class_name
     raise ValueError(f"Could not match any class in {classes} from filename '{path.name}'")
+
+
+def build_transforms(train: bool = False, image_size: tuple[int, int] = DEFAULT_IMAGE_SIZE) -> transforms.Compose:
+    """Use mild, microscopy-safe augmentations only during training."""
+    if train:
+        return transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.RandomRotation(degrees=15),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+    return transforms.Compose([
+        transforms.Resize(image_size),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
+
 
 class FilenameStageDataset(Dataset):
     def __init__(
@@ -53,19 +88,27 @@ class FilenameStageDataset(Dataset):
         folder: Path,
         class_names: list[str] | None = None,
         transform: transforms.Compose | None = None,
+        exclude_tif_tif: bool = True,
     ) -> None:
-        self.folder = folder
+        self.folder = Path(folder)
         self.class_names = list(class_names) if class_names is not None else list(DEFAULT_CLASS_NAMES)
         self.class_to_idx = {name: idx for idx, name in enumerate(self.class_names)}
-        self.transform = transform or transforms.Compose([
-            transforms.Resize(DEFAULT_IMAGE_SIZE),
-            transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ])
+        self.transform = transform or build_transforms(train=False)
 
-        self.image_paths = sorted(folder.glob("*.png"))
+        all_pngs = sorted(self.folder.glob("*.png"))
+        if not all_pngs:
+            raise FileNotFoundError(f"No .png files found in {self.folder}")
+
+        self.skipped_paths: list[Path] = []
+        self.image_paths: list[Path] = []
+        for p in all_pngs:
+            if exclude_tif_tif and has_excluded_tif_tif_name(p):
+                self.skipped_paths.append(p)
+            else:
+                self.image_paths.append(p)
+
         if not self.image_paths:
-            raise FileNotFoundError(f"No .png files found in {folder}")
+            raise RuntimeError(f"All .png files in {self.folder} were excluded by filter.")
 
         self.labels: list[int] = []
         self.group_ids: list[str] = []
@@ -86,830 +129,399 @@ class FilenameStageDataset(Dataset):
         return tensor, label
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0) -> None:
-        super().__init__()
-        layers: list[nn.Module] = [
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.SiLU(inplace=True),
-        ]
-        if dropout > 0.0:
-            layers.append(nn.Dropout2d(p=dropout))
-        layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
-        self.block = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
-
-
 class StageDeathCNN(nn.Module):
     def __init__(
         self,
-        in_channels: int = 3,
-        class_names: list[str] | None = None,
-        backbone: str = "resnet18",
+        num_classes: int = 3,
         pretrained: bool = True,
+        freeze_backbone: bool = True,
+        unfreeze_layer4: bool = False,
+        dropout_p: float = 0.5,
     ) -> None:
         super().__init__()
-        self.class_names = list(class_names) if class_names is not None else list(DEFAULT_CLASS_NAMES)
-        num_classes = len(self.class_names)
-        self.backbone_name = backbone
-        self.use_pretrained_backbone = backbone == "resnet18"
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        try:
+            net = models.resnet18(weights=weights)
+        except Exception:
+            net = models.resnet18(weights=None)
 
-        if self.use_pretrained_backbone:
-            weights = models.ResNet18_Weights.DEFAULT if pretrained else None
-            try:
-                net = models.resnet18(weights=weights)
-            except Exception:
-                net = models.resnet18(weights=None)
-            in_features = net.fc.in_features
-            net.fc = nn.Sequential(
-                nn.Dropout(p=0.35),
-                nn.Linear(in_features, num_classes),
-            )
-            self.backbone = net
-        else:
-            self.features = nn.Sequential(
-                ConvBlock(in_channels, 32, dropout=0.0),
-                ConvBlock(32, 64, dropout=0.05),
-                ConvBlock(64, 128, dropout=0.10),
-                ConvBlock(128, 256, dropout=0.15),
-            )
-            self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-            self.max_pool = nn.AdaptiveMaxPool2d((1, 1))
-            self.classifier = nn.Sequential(
-                nn.Flatten(),
-                nn.Dropout(p=0.3),
-                nn.Linear(512, 128),
-                nn.BatchNorm1d(128),
-                nn.SiLU(inplace=True),
-                nn.Dropout(p=0.2),
-                nn.Linear(128, num_classes),
-            )
+        in_features = net.fc.in_features
+        net.fc = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(in_features, num_classes),
+        )
+        self.backbone = net
+        self.configure_trainable_params(freeze_backbone=freeze_backbone, unfreeze_layer4=unfreeze_layer4)
+
+    def configure_trainable_params(self, freeze_backbone: bool = True, unfreeze_layer4: bool = False) -> None:
+        for param in self.backbone.parameters():
+            param.requires_grad = not freeze_backbone
+
+        for param in self.backbone.fc.parameters():
+            param.requires_grad = True
+
+        if freeze_backbone and unfreeze_layer4:
+            for param in self.backbone.layer4.parameters():
+                param.requires_grad = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_pretrained_backbone:
-            return self.backbone(x)
-        feat = self.features(x)
-        pooled = torch.cat([self.avg_pool(feat), self.max_pool(feat)], dim=1)
-        return self.classifier(pooled)
-
-    @torch.no_grad()
-    def predict_probs(self, x: torch.Tensor) -> torch.Tensor:
-        self.eval()
-        logits = self(x)
-        return torch.softmax(logits, dim=1)
-
-    @torch.no_grad()
-    def predict(
-        self,
-        x: torch.Tensor,
-        class_multipliers: list[float] | np.ndarray | None = None,
-    ) -> list[dict[str, float | int | str]]:
-        probs = self.predict_probs(x)
-        if class_multipliers is not None:
-            mult = torch.tensor(class_multipliers, dtype=probs.dtype, device=probs.device).unsqueeze(0)
-            adjusted = probs * mult
-            adjusted = adjusted / adjusted.sum(dim=1, keepdim=True).clamp_min(1e-8)
-        else:
-            adjusted = probs
-
-        confidences, indices = torch.max(adjusted, dim=1)
-        results = []
-        for idx, conf in zip(indices.tolist(), confidences.tolist()):
-            results.append({
-                "class_name": self.class_names[idx],
-                "class_index": idx,
-                "confidence": round(conf, 4),
-            })
-        return results
+        return self.backbone(x)
 
 
-def compute_confusion_matrix(
+def compute_metrics(
     y_true: list[int] | np.ndarray,
     y_pred: list[int] | np.ndarray,
-    num_classes: int,
-) -> np.ndarray:
-    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
-    for t, p in zip(np.asarray(y_true, dtype=np.int64), np.asarray(y_pred, dtype=np.int64)):
-        if 0 <= t < num_classes and 0 <= p < num_classes:
-            cm[t, p] += 1
-    return cm
-
-
-def compute_classification_metrics(
-    y_true: list[int] | np.ndarray,
-    y_pred: list[int] | np.ndarray,
-    class_names: list[str] | None = None,
-) -> dict[str, object]:
-    """Compute per-class, macro, and weighted precision, recall, F1, plus confusion matrix."""
-    names = list(class_names) if class_names is not None else list(DEFAULT_CLASS_NAMES)
-    num_classes = len(names)
+    class_names: list[str],
+) -> dict[str, Any]:
+    num_classes = len(class_names)
     y_t = np.asarray(y_true, dtype=np.int64)
     y_p = np.asarray(y_pred, dtype=np.int64)
-    cm = compute_confusion_matrix(y_t, y_p, num_classes=num_classes)
+
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for t, p in zip(y_t, y_p):
+        if 0 <= t < num_classes and 0 <= p < num_classes:
+            cm[t, p] += 1
 
     per_class: dict[str, dict[str, float | int]] = {}
-    precisions = np.zeros(num_classes, dtype=np.float64)
-    recalls = np.zeros(num_classes, dtype=np.float64)
-    f1s = np.zeros(num_classes, dtype=np.float64)
-    supports = np.zeros(num_classes, dtype=np.int64)
+    precisions, recalls, f1s, supports = [], [], [], []
 
     for c in range(num_classes):
-        tp = int(cm[c, c])
-        fp = int(np.sum(cm[:, c]) - tp)
-        fn = int(np.sum(cm[c, :]) - tp)
-        support = int(np.sum(cm[c, :]))
-        supports[c] = support
+        tp = float(cm[c, c])
+        fp = float(cm[:, c].sum() - tp)
+        fn = float(cm[c, :].sum() - tp)
+        sup = int(cm[c, :].sum())
 
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
 
-        precisions[c] = precision
-        recalls[c] = recall
-        f1s[c] = f1
-
-        per_class[names[c]] = {
-            "precision": round(float(precision), 4),
-            "recall": round(float(recall), 4),
-            "f1": round(float(f1), 4),
-            "support": support,
+        per_class[class_names[c]] = {
+            "precision": prec,
+            "recall": rec,
+            "f1": f1,
+            "support": sup,
         }
+        precisions.append(prec)
+        recalls.append(rec)
+        f1s.append(f1)
+        supports.append(sup)
 
-    total_support = int(np.sum(supports))
-    weights = supports / total_support if total_support > 0 else np.zeros(num_classes, dtype=np.float64)
+    acc = float((y_t == y_p).mean()) if len(y_t) > 0 else 0.0
+    total_sup = max(sum(supports), 1)
+    weights = np.array(supports, dtype=np.float64) / total_sup
 
     return {
-        "accuracy": round(float(np.mean(y_t == y_p)), 4) if len(y_t) > 0 else 0.0,
-        "macro_precision": round(float(np.mean(precisions)), 4),
-        "macro_recall": round(float(np.mean(recalls)), 4),
-        "macro_f1": round(float(np.mean(f1s)), 4),
-        "weighted_precision": round(float(np.sum(precisions * weights)), 4),
-        "weighted_recall": round(float(np.sum(recalls * weights)), 4),
-        "weighted_f1": round(float(np.sum(f1s * weights)), 4),
+        "accuracy": acc,
+        "macro_precision": float(np.mean(precisions)),
+        "macro_recall": float(np.mean(recalls)),
+        "macro_f1": float(np.mean(f1s)),
+        "weighted_f1": float(np.sum(np.array(f1s) * weights)),
         "per_class": per_class,
-        "confusion_matrix": cm.tolist(),
-        "class_names": names,
+        "confusion_matrix": cm,
     }
 
 
-def print_metrics_report(metrics: dict[str, object], title: str = "Classification Metrics") -> None:
-    print(f"\n=== {title} ===")
-    print(f"Accuracy         : {metrics['accuracy']:.2%}")
-    print(
-        f"Macro Avg        : Precision={metrics['macro_precision']:.4f} | "
-        f"Recall={metrics['macro_recall']:.4f} | F1={metrics['macro_f1']:.4f}"
-    )
-    print(
-        f"Weighted Avg     : Precision={metrics['weighted_precision']:.4f} | "
-        f"Recall={metrics['weighted_recall']:.4f} | F1={metrics['weighted_f1']:.4f}"
-    )
-    per_class = metrics["per_class"]  # type: ignore[assignment]
-    for cls_name, stats in per_class.items():
-        print(
-            f"  - {cls_name:<12} | Precision={stats['precision']:.4f} | "
-            f"Recall={stats['recall']:.4f} | F1={stats['f1']:.4f} | "
-            f"Support={stats['support']}"
-        )
-    if "confusion_matrix" in metrics:
-        cm = np.asarray(metrics["confusion_matrix"])
-        names = metrics.get("class_names", DEFAULT_CLASS_NAMES)  # type: ignore[assignment]
-        print("  Confusion Matrix (rows=true, cols=pred):")
-        print("   ", " ".join(f"{n[:8]:>8}" for n in names))
-        for r_idx, row in enumerate(cm):
-            print(f"  {names[r_idx][:8]:<8}", " ".join(f"{val:8d}" for val in row))
-
-
-def tune_class_multipliers(
-    oof_probs: np.ndarray,
-    oof_targets: np.ndarray,
-    class_names: list[str],
-    grid_values: tuple[float, ...] = (0.75, 0.9, 1.0, 1.1, 1.25, 1.4),
-) -> list[float]:
-    """Search class probability multipliers on out-of-fold predictions to maximize macro F1."""
-    num_classes = len(class_names)
-    if len(oof_targets) == 0 or num_classes == 0:
-        return [1.0] * max(1, num_classes)
-
-    best_f1 = -1.0
-    best_mult = [1.0] * num_classes
-    current = [1.0] * num_classes
-    for _ in range(2):
-        for c in range(num_classes):
-            for val in grid_values:
-                candidate = list(current)
-                candidate[c] = val
-                mult_arr = np.asarray(candidate, dtype=np.float64)[None, :]
-                preds = np.argmax(oof_probs * mult_arr, axis=1)
-                m = compute_classification_metrics(oof_targets, preds, class_names=class_names)
-                score = float(m["macro_f1"])  # type: ignore[arg-type]
-                if score > best_f1:
-                    best_f1 = score
-                    best_mult = candidate
-        current = list(best_mult)
-
-    return [round(float(x), 3) for x in best_mult]
-
-
-def _compute_class_weights(labels: list[int], num_classes: int, device: torch.device) -> torch.Tensor:
-    counts = np.bincount(np.asarray(labels, dtype=np.int64), minlength=num_classes).astype(np.float64)
-    total = float(np.sum(counts))
-    weights = np.ones(num_classes, dtype=np.float32)
-    for c in range(num_classes):
-        if counts[c] > 0:
-            weights[c] = float(total / (num_classes * counts[c]))
-    weights = np.sqrt(weights)
-    return torch.tensor(weights, dtype=torch.float32, device=device)
-
-
-def _build_weighted_sampler(subset_labels: list[int], num_classes: int) -> WeightedRandomSampler:
-    counts = np.bincount(np.asarray(subset_labels, dtype=np.int64), minlength=num_classes).astype(np.float64)
-    per_class_weight = {c: (1.0 / counts[c]) if counts[c] > 0 else 0.0 for c in range(num_classes)}
-    sample_weights = torch.tensor([per_class_weight[lbl] for lbl in subset_labels], dtype=torch.double)
-    return WeightedRandomSampler(weights=sample_weights, num_samples=len(subset_labels), replacement=True)
-
-
-def _group_stratified_kfold_indices(
-    labels: list[int],
-    group_ids: list[str] | None = None,
-    n_splits: int = 5,
+def make_leave_one_group_out_folds(
+    group_ids: list[str],
+    n_splits: int | None = None,
     seed: int = 42,
-) -> list[tuple[list[int], list[int]]]:
-    """Group-aware stratified K-fold split keeping each cell/group intact across train and val."""
-    total = len(labels)
-    if total == 0:
-        return []
+) -> list[tuple[str, np.ndarray, np.ndarray]]:
+    """
+    Create Leave-One-Group-Out (LOGO) folds when `n_splits is None` or `n_splits >= num_groups`,
+    or group folds into `n_splits` buckets if a smaller fold count is requested.
 
+    Returns list of (val_group_label, train_indices, val_indices).
+    """
+    unique_groups = sorted(set(group_ids))
+    if len(unique_groups) < 2:
+        raise ValueError(f"Need at least 2 cell groups for cross-validation, found {len(unique_groups)}.")
+
+    group_to_indices: dict[str, np.ndarray] = {
+        g: np.array([i for i, gid in enumerate(group_ids) if gid == g], dtype=np.int64)
+        for g in unique_groups
+    }
+
+    if n_splits is None or n_splits >= len(unique_groups):
+        # True Leave-One-Group-Out: one cell group held out as validation per fold
+        folds: list[tuple[str, np.ndarray, np.ndarray]] = []
+        for val_g in unique_groups:
+            val_idx = group_to_indices[val_g]
+            train_idx = np.concatenate([group_to_indices[g] for g in unique_groups if g != val_g])
+            folds.append((val_g, train_idx, val_idx))
+        return folds
+
+    # K-fold group split across unique cell groups
     rng = np.random.default_rng(seed)
-    unique_groups = sorted(set(group_ids)) if group_ids is not None else []
-    effective_splits = min(n_splits, len(unique_groups)) if len(unique_groups) >= 2 else n_splits
+    shuffled_groups = np.array(unique_groups)
+    rng.shuffle(shuffled_groups)
 
-    if len(unique_groups) >= 2 and effective_splits >= 2:
-        group_to_indices: dict[str, list[int]] = {}
-        group_primary_label: dict[str, int] = {}
-        for idx, lbl in enumerate(labels):
-            g = group_ids[idx] if group_ids is not None else str(idx)
-            group_to_indices.setdefault(g, []).append(idx)
-        for g, idxs in group_to_indices.items():
-            g_lbls = [labels[i] for i in idxs]
-            group_primary_label[g] = int(np.bincount(g_lbls).argmax())
+    fold_buckets: list[list[str]] = [[] for _ in range(n_splits)]
+    for idx, g in enumerate(shuffled_groups.tolist()):
+        fold_buckets[idx % n_splits].append(g)
 
-        label_to_groups: dict[int, list[str]] = {}
-        for g, p_lbl in group_primary_label.items():
-            label_to_groups.setdefault(p_lbl, []).append(g)
-
-        fold_val_indices: list[list[int]] = [[] for _ in range(effective_splits)]
-        for _, grp_list in label_to_groups.items():
-            shuffled_grps = list(grp_list)
-            rng.shuffle(shuffled_grps)
-            for pos, g in enumerate(shuffled_grps):
-                fold_val_indices[pos % effective_splits].extend(group_to_indices[g])
-
-        all_set = set(range(total))
-        folds: list[tuple[list[int], list[int]]] = []
-        for val_idx in fold_val_indices:
-            if not val_idx:
-                continue
-            val_set = set(val_idx)
-            train_idx = sorted(all_set - val_set)
-            if train_idx:
-                folds.append((train_idx, sorted(val_idx)))
-        if folds:
-            return folds
-
-    generator = torch.Generator().manual_seed(seed)
-    class_to_indices: dict[int, list[int]] = {}
-    for idx, label in enumerate(labels):
-        class_to_indices.setdefault(label, []).append(idx)
-    if not class_to_indices or min(len(v) for v in class_to_indices.values()) < effective_splits:
-        perm = torch.randperm(total, generator=generator).tolist()
-        val_size = max(1, len(perm) // effective_splits)
-        folds = []
-        for start in range(0, len(perm), val_size):
-            val_idx = perm[start : start + val_size]
-            if not val_idx:
-                continue
-            val_set = set(val_idx)
-            train_idx = [i for i in perm if i not in val_set]
-            if train_idx:
-                folds.append((train_idx, val_idx))
-        return folds if folds else [(perm, perm)]
-
-    fold_val_buckets: list[list[int]] = [[] for _ in range(effective_splits)]
-    for indices in class_to_indices.values():
-        t_idx = torch.tensor(indices)
-        shuffled = t_idx[torch.randperm(len(indices), generator=generator)].tolist()
-        for pos, sample_idx in enumerate(shuffled):
-            fold_val_buckets[pos % effective_splits].append(sample_idx)
-
-    all_set = set(range(total))
     folds = []
-    for val_idx in fold_val_buckets:
-        val_set = set(val_idx)
-        train_idx = sorted(all_set - val_set)
-        folds.append((train_idx, sorted(val_idx)))
+    for f_idx, val_groups in enumerate(fold_buckets):
+        val_set = set(val_groups)
+        train_groups = [g for g in unique_groups if g not in val_set]
+        if not val_groups or not train_groups:
+            continue
+        val_idx = np.concatenate([group_to_indices[g] for g in val_groups])
+        train_idx = np.concatenate([group_to_indices[g] for g in train_groups])
+        folds.append((f"fold_{f_idx+1}({','.join(val_groups)})", train_idx, val_idx))
+
     return folds
 
 
-def _select_stratified_indices(
-    labels: list[int],
-    group_ids: list[str] | None = None,
-    fraction: float = 0.85,
-    seed: int = 42,
-) -> list[int]:
-    total = len(labels)
-    target_count = max(1, min(total, int(round(total * fraction))))
-    if target_count >= total:
-        return list(range(total))
+def compute_class_weights(train_labels: list[int], num_classes: int, device: torch.device) -> torch.Tensor:
+    counts = np.bincount(np.asarray(train_labels, dtype=np.int64), minlength=num_classes).astype(np.float32)
+    counts = np.clip(counts, min=1.0)
+    weights = counts.sum() / (num_classes * counts)
+    return torch.tensor(weights, dtype=torch.float32, device=device)
 
-    rng = np.random.default_rng(seed)
-    unique_groups = sorted(set(group_ids)) if group_ids is not None else []
-    if len(unique_groups) >= 4:
-        group_to_indices: dict[str, list[int]] = {}
-        for idx, g in enumerate(group_ids):  # type: ignore[union-attr]
-            group_to_indices.setdefault(g, []).append(idx)
-        shuffled_groups = list(unique_groups)
-        rng.shuffle(shuffled_groups)
-        selected: list[int] = []
-        for g in shuffled_groups:
-            if len(selected) + len(group_to_indices[g]) <= target_count:
-                selected.extend(group_to_indices[g])
-        if selected:
-            return sorted(selected)
 
-    generator = torch.Generator().manual_seed(seed)
-    class_to_indices: dict[int, list[int]] = {}
-    for idx, label in enumerate(labels):
-        class_to_indices.setdefault(label, []).append(idx)
-    if len(class_to_indices) > 1 and min(len(v) for v in class_to_indices.values()) >= 2:
-        selected = []
-        for indices in class_to_indices.values():
-            t_idx = torch.tensor(indices)
-            shuffled = t_idx[torch.randperm(len(indices), generator=generator)].tolist()
-            take = max(1, min(len(shuffled), round(len(shuffled) * fraction)))
-            selected.extend(shuffled[:take])
-        if len(selected) > target_count:
-            selected = selected[:target_count]
-        elif len(selected) < target_count:
-            remaining = [i for i in range(total) if i not in set(selected)]
-            perm_rem = torch.tensor(remaining)[torch.randperm(len(remaining), generator=generator)].tolist()
-            selected.extend(perm_rem[: target_count - len(selected)])
-        return sorted(selected)
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> tuple[float, float]:
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
 
-    perm = torch.randperm(total, generator=generator).tolist()
-    return sorted(perm[:target_count])
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        optimizer.zero_grad()
+        logits = model(x)
+        loss = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+
+        batch_size = y.size(0)
+        total_loss += float(loss.item()) * batch_size
+        preds = logits.argmax(dim=1)
+        correct += int((preds == y).sum().item())
+        total += batch_size
+
+    return total_loss / max(total, 1), correct / max(total, 1)
 
 
 @torch.no_grad()
-def _evaluate(
+def evaluate(
     model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-    class_names: list[str] | None = None,
-    class_multipliers: list[float] | None = None,
-) -> tuple[float, float, dict[str, object], np.ndarray, np.ndarray]:
+    class_names: list[str],
+) -> tuple[float, dict[str, Any], list[int], list[int]]:
     model.eval()
-    running_loss = 0.0
+    total_loss = 0.0
     total = 0
-    all_targets: list[int] = []
-    all_preds: list[int] = []
-    all_probs: list[np.ndarray] = []
+    all_true: list[int] = []
+    all_pred: list[int] = []
 
-    mult_tensor = (
-        torch.tensor(class_multipliers, dtype=torch.float32, device=device).unsqueeze(0)
-        if class_multipliers is not None
-        else None
-    )
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
 
-    for images, labels in loader:
-        images, labels = images.to(device), labels.to(device)
-        logits = model(images)
-        loss = criterion(logits, labels)
-        running_loss += loss.item() * images.size(0)
-        probs = torch.softmax(logits, dim=1)
-        all_probs.append(probs.cpu().numpy())
+        logits = model(x)
+        loss = criterion(logits, y)
 
-        scored = probs * mult_tensor if mult_tensor is not None else probs
-        preds = scored.argmax(dim=1)
-        total += labels.size(0)
-        all_targets.extend(labels.cpu().tolist())
-        all_preds.extend(preds.cpu().tolist())
+        batch_size = y.size(0)
+        total_loss += float(loss.item()) * batch_size
+        total += batch_size
 
-    avg_loss = running_loss / total if total > 0 else 0.0
-    targets_arr = np.asarray(all_targets, dtype=np.int64)
-    probs_arr = np.vstack(all_probs) if all_probs else np.zeros((0, len(class_names or DEFAULT_CLASS_NAMES)))
-    metrics = compute_classification_metrics(targets_arr, all_preds, class_names=class_names)
-    accuracy = float(metrics["accuracy"])  # type: ignore[arg-type]
-    return avg_loss, accuracy, metrics, targets_arr, probs_arr
+        preds = logits.argmax(dim=1)
+        all_true.extend(y.cpu().tolist())
+        all_pred.extend(preds.cpu().tolist())
+
+    metrics = compute_metrics(all_true, all_pred, class_names)
+    return total_loss / max(total, 1), metrics, all_true, all_pred
 
 
-def _build_optimizer(model: StageDeathCNN, lr: float, weight_decay: float) -> torch.optim.Optimizer:
-    if model.use_pretrained_backbone:
-        backbone_params = []
-        head_params = []
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if ".fc." in name:
-                head_params.append(param)
-            else:
-                backbone_params.append(param)
-        return torch.optim.AdamW(
-            [
-                {"params": backbone_params, "lr": lr * 0.1},
-                {"params": head_params, "lr": lr},
-            ],
-            weight_decay=weight_decay,
-        )
-    return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+def build_optimizer(model: StageDeathCNN, head_lr: float, backbone_lr: float, weight_decay: float) -> torch.optim.Optimizer:
+    head_params = [p for p in model.backbone.fc.parameters() if p.requires_grad]
+    backbone_params = [
+        p for name, p in model.backbone.named_parameters()
+        if p.requires_grad and not name.startswith("fc.")
+    ]
+    param_groups = [{"params": head_params, "lr": head_lr, "weight_decay": weight_decay}]
+    if backbone_params:
+        param_groups.append({"params": backbone_params, "lr": backbone_lr, "weight_decay": weight_decay})
+    return torch.optim.AdamW(param_groups)
 
 
-def model_train(
-    epochs: int = 40,
+def run_experiment(
+    data_dir: Path,
+    trials: list[dict[str, Any]],
+    n_splits: int | None = None,  # None => Leave-One-Group-Out across all cell groups
+    epochs: int = 25,
     batch_size: int = 8,
-    lr: float = 2e-4,
-    data_dir: Path | None = None,
-    checkpoint_path: Path = CHECKPOINT_PATH,
-    train_fraction: float = 0.85,
-    n_splits: int = 5,
     seed: int = 42,
-    backbone: str = "resnet18",
-    pretrained: bool = True,
-    use_weighted_sampler: bool = True,
-    fit_final_on_dev: bool = True,
-) -> StageDeathCNN:
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
+    save_dir: Path | None = None,
+) -> None:
+    set_seed(seed)
+    device = get_device()
+    save_dir = save_dir or Path(".")
+    save_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    frames_dir = data_dir if data_dir is not None else Path(__file__).resolve().parent / "data" / "features" / "filtered"
-    if not frames_dir.exists():
-        raise FileNotFoundError(f"Filtered directory not found at {frames_dir}")
-
-    train_transform = transforms.Compose([
-        transforms.Resize(DEFAULT_IMAGE_SIZE),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.5),
-        transforms.RandomRotation(degrees=45),
-        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.9, 1.1)),
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
-    eval_transform = transforms.Compose([
-        transforms.Resize(DEFAULT_IMAGE_SIZE),
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
-
-    train_full_dataset = FilenameStageDataset(
-        folder=frames_dir,
+    base_ds = FilenameStageDataset(
+        data_dir,
         class_names=DEFAULT_CLASS_NAMES,
-        transform=train_transform,
+        transform=build_transforms(train=False),
+        exclude_tif_tif=True,
     )
-    eval_full_dataset = FilenameStageDataset(
-        folder=frames_dir,
+    train_aug_ds = FilenameStageDataset(
+        data_dir,
         class_names=DEFAULT_CLASS_NAMES,
-        transform=eval_transform,
+        transform=build_transforms(train=True),
+        exclude_tif_tif=True,
     )
 
-    all_labels = list(train_full_dataset.labels)
-    all_groups = list(train_full_dataset.group_ids)
-    dev_indices = _select_stratified_indices(all_labels, group_ids=all_groups, fraction=train_fraction, seed=seed)
-    dev_labels = [all_labels[i] for i in dev_indices]
-    dev_groups = [all_groups[i] for i in dev_indices]
+    folds = make_leave_one_group_out_folds(group_ids=base_ds.group_ids, n_splits=n_splits, seed=seed)
+    mode_label = "Leave-One-Group-Out (LOGO)" if (n_splits is None or n_splits >= len(set(base_ds.group_ids))) else f"{len(folds)}-Fold Group CV"
 
     print(
-        f"Total samples in {frames_dir}: {len(all_labels)} | "
-        f"Dev subset ({train_fraction:.0%}): {len(dev_indices)} samples | "
-        f"Held-out samples: {len(all_labels) - len(dev_indices)}"
+        f"Device: {device} | Usable samples: {len(base_ds)} | "
+        f"Skipped tif.tif: {len(base_ds.skipped_paths)} | Unique cell groups: {len(set(base_ds.group_ids))} | "
+        f"CV Mode: {mode_label} ({len(folds)} folds)"
     )
 
-    folds = _group_stratified_kfold_indices(dev_labels, group_ids=dev_groups, n_splits=n_splits, seed=seed)
-    print(f"Running {len(folds)}-fold cell-grouped stratified cross-validation on {len(dev_indices)} samples...")
+    best_score = -1.0
+    best_ckpt_path: Path | None = None
 
-    num_classes = len(DEFAULT_CLASS_NAMES)
-    effective_batch_size = max(1, min(batch_size, len(dev_indices)))
-
-    oof_targets_list: list[np.ndarray] = []
-    oof_probs_list: list[np.ndarray] = []
-    fold_best_f1s: list[float] = []
-    fold_best_accs: list[float] = []
-
-    for fold_idx, (rel_train_idx, rel_val_idx) in enumerate(folds, start=1):
-        fold_train_indices = [dev_indices[i] for i in rel_train_idx]
-        fold_val_indices = [dev_indices[i] for i in rel_val_idx]
-        fold_train_labels = [all_labels[i] for i in fold_train_indices]
-
-        train_subset = Subset(train_full_dataset, fold_train_indices)
-        val_subset = Subset(eval_full_dataset, fold_val_indices)
-
-        if use_weighted_sampler and len(set(fold_train_labels)) > 1:
-            sampler = _build_weighted_sampler(fold_train_labels, num_classes=num_classes)
-            train_loader = DataLoader(
-                train_subset,
-                batch_size=min(effective_batch_size, len(train_subset)),
-                sampler=sampler,
-                num_workers=0,
-            )
-        else:
-            train_loader = DataLoader(
-                train_subset,
-                batch_size=min(effective_batch_size, len(train_subset)),
-                shuffle=True,
-                num_workers=0,
-            )
-
-        val_loader = DataLoader(
-            val_subset,
-            batch_size=min(effective_batch_size, len(val_subset)),
-            shuffle=False,
-            num_workers=0,
-        )
-
-        model = StageDeathCNN(
-            in_channels=3,
-            class_names=DEFAULT_CLASS_NAMES,
-            backbone=backbone,
-            pretrained=pretrained,
-        ).to(device)
-        class_weights = _compute_class_weights(fold_train_labels, num_classes=num_classes, device=device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
-        optimizer = _build_optimizer(model, lr=lr, weight_decay=3e-2)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=lr * 0.05)
+    for t_idx, cfg in enumerate(trials, start=1):
+        set_seed(seed + t_idx)
+        freeze_backbone = cfg.get("freeze_backbone", True)
+        unfreeze_layer4 = cfg.get("unfreeze_layer4", False)
+        head_lr = cfg.get("head_lr", 1e-3)
+        backbone_lr = cfg.get("backbone_lr", 1e-4)
+        weight_decay = cfg.get("weight_decay", 1e-2)
+        dropout_p = cfg.get("dropout_p", 0.5)
 
         print(
-            f"\n--- Fold {fold_idx}/{len(folds)} "
-            f"(train={len(train_subset)}, val={len(val_subset)}) ---"
+            f"\n=== Trial {t_idx}: freeze_backbone={freeze_backbone}, "
+            f"unfreeze_layer4={unfreeze_layer4}, head_lr={head_lr}, weight_decay={weight_decay} ==="
         )
 
-        best_fold_f1 = -1.0
-        best_fold_acc = -1.0
-        best_fold_probs = np.zeros((len(val_subset), num_classes), dtype=np.float64)
-        best_fold_targets = np.asarray([all_labels[i] for i in fold_val_indices], dtype=np.int64)
+        oof_true: list[int] = []
+        oof_pred: list[int] = []
+        fold_accs: list[float] = []
 
-        for epoch in range(1, epochs + 1):
-            model.train()
-            running_loss = 0.0
-            correct = 0
-            total = 0
-            for images, labels in train_loader:
-                images, labels = images.to(device), labels.to(device)
-                optimizer.zero_grad()
-                logits = model(images)
-                loss = criterion(logits, labels)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
-                optimizer.step()
+        for f_idx, (group_label, tr_idx, va_idx) in enumerate(folds, start=1):
+            tr_labels = [base_ds.labels[int(i)] for i in tr_idx]
+            criterion = nn.CrossEntropyLoss(weight=compute_class_weights(tr_labels, len(DEFAULT_CLASS_NAMES), device))
 
-                running_loss += loss.item() * images.size(0)
-                preds = logits.argmax(dim=1)
-                correct += (preds == labels).sum().item()
-                total += labels.size(0)
-
-            scheduler.step()
-            train_loss = running_loss / total if total > 0 else 0.0
-            train_acc = correct / total if total > 0 else 0.0
-            val_loss, val_acc, val_metrics, val_t_arr, val_p_arr = _evaluate(
-                model, val_loader, criterion, device, class_names=DEFAULT_CLASS_NAMES
-            )
-            val_f1 = float(val_metrics.get("macro_f1", 0.0))  # type: ignore[arg-type]
-            if (val_f1 > best_fold_f1) or (val_f1 == best_fold_f1 and val_acc > best_fold_acc):
-                best_fold_f1 = val_f1
-                best_fold_acc = val_acc
-                best_fold_probs = val_p_arr
-                best_fold_targets = val_t_arr
-
-            if epoch == epochs or epoch % max(1, epochs // 5) == 0:
-                print(
-                    f"Epoch [{epoch}/{epochs}] - "
-                    f"Train Loss: {train_loss:.4f} Acc: {train_acc:.2%} | "
-                    f"Val Loss: {val_loss:.4f} Acc: {val_acc:.2%} "
-                    f"F1(macro): {val_f1:.4f}"
-                )
-
-        fold_best_f1s.append(best_fold_f1)
-        fold_best_accs.append(best_fold_acc)
-        oof_targets_list.append(best_fold_targets)
-        oof_probs_list.append(best_fold_probs)
-
-    oof_targets = np.concatenate(oof_targets_list) if oof_targets_list else np.zeros((0,), dtype=np.int64)
-    oof_probs = np.vstack(oof_probs_list) if oof_probs_list else np.zeros((0, num_classes), dtype=np.float64)
-
-    raw_oof_preds = np.argmax(oof_probs, axis=1) if len(oof_targets) > 0 else np.zeros((0,), dtype=np.int64)
-    oof_metrics = compute_classification_metrics(oof_targets, raw_oof_preds, class_names=DEFAULT_CLASS_NAMES)
-    print_metrics_report(oof_metrics, title="Out-of-Fold Validation Metrics (All Folds)")
-
-    tuned_multipliers = tune_class_multipliers(oof_probs, oof_targets, class_names=DEFAULT_CLASS_NAMES)
-    tuned_preds = np.argmax(oof_probs * np.asarray(tuned_multipliers)[None, :], axis=1)
-    tuned_oof_metrics = compute_classification_metrics(oof_targets, tuned_preds, class_names=DEFAULT_CLASS_NAMES)
-    print(f"\nTuned OOF Class Multipliers: {dict(zip(DEFAULT_CLASS_NAMES, tuned_multipliers))}")
-    print_metrics_report(tuned_oof_metrics, title="Out-of-Fold Metrics After Multiplier Tuning")
-
-    mean_cv_f1 = float(np.mean(fold_best_f1s)) if fold_best_f1s else 0.0
-    mean_cv_acc = float(np.mean(fold_best_accs)) if fold_best_accs else 0.0
-    tuned_oof_f1 = float(tuned_oof_metrics.get("macro_f1", 0.0))  # type: ignore[arg-type]
-    final_epochs = max(15, epochs)
-
-    if fit_final_on_dev:
-        print(f"\nFitting final model on full dev set ({len(dev_indices)} samples) for {final_epochs} epochs...")
-        dev_train_subset = Subset(train_full_dataset, dev_indices)
-        if use_weighted_sampler and len(set(dev_labels)) > 1:
-            dev_sampler = _build_weighted_sampler(dev_labels, num_classes=num_classes)
-            dev_loader = DataLoader(
-                dev_train_subset,
-                batch_size=effective_batch_size,
-                sampler=dev_sampler,
-                num_workers=0,
-            )
-        else:
-            dev_loader = DataLoader(
-                dev_train_subset,
-                batch_size=effective_batch_size,
+            train_loader = DataLoader(
+                Subset(train_aug_ds, tr_idx.tolist()),
+                batch_size=min(batch_size, max(1, len(tr_idx))),
                 shuffle=True,
-                num_workers=0,
+                drop_last=len(tr_idx) > batch_size,
             )
+            val_loader = DataLoader(Subset(base_ds, va_idx.tolist()), batch_size=batch_size, shuffle=False)
+
+            model = StageDeathCNN(
+                num_classes=len(DEFAULT_CLASS_NAMES),
+                pretrained=True,
+                freeze_backbone=freeze_backbone,
+                unfreeze_layer4=unfreeze_layer4,
+                dropout_p=dropout_p,
+            ).to(device)
+            optimizer = build_optimizer(model, head_lr=head_lr, backbone_lr=backbone_lr, weight_decay=weight_decay)
+
+            best_val_acc = -1.0
+            best_fold_weights = copy.deepcopy(model.state_dict())
+            best_fold_preds: list[int] = []
+            best_fold_trues: list[int] = []
+
+            for epoch in range(1, epochs + 1):
+                tr_loss, tr_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
+                va_loss, va_metrics, v_true, v_pred = evaluate(model, val_loader, criterion, device, DEFAULT_CLASS_NAMES)
+                # Using val accuracy/loss for single-group selection avoids single-group F1 step jumps
+                if va_metrics["accuracy"] > best_val_acc or (
+                    va_metrics["accuracy"] == best_val_acc and epoch == 1
+                ):
+                    best_val_acc = va_metrics["accuracy"]
+                    best_fold_weights = copy.deepcopy(model.state_dict())
+                    best_fold_preds = v_pred
+                    best_fold_trues = v_true
+
+            fold_accs.append(best_val_acc)
+            oof_true.extend(best_fold_trues)
+            oof_pred.extend(best_fold_preds)
+            print(
+                f"  Fold {f_idx:02d}/{len(folds):02d} [{group_label}] "
+                f"(train={len(tr_idx)}, val={len(va_idx)}) -> Best Val Acc: {best_val_acc*100:5.1f}% "
+                f"(preds={best_fold_preds}, true={best_fold_trues})"
+            )
+
+        oof_metrics = compute_metrics(oof_true, oof_pred, DEFAULT_CLASS_NAMES)
+        print(
+            f"Trial {t_idx} Overall LOGO -> Acc: {oof_metrics['accuracy']*100:.2f}% | "
+            f"Macro F1: {oof_metrics['macro_f1']:.4f} | Mean Fold Acc: {np.mean(fold_accs)*100:.2f}%"
+        )
+        print("  Per-class OOF metrics:", oof_metrics["per_class"])
+        print("  OOF Confusion Matrix (rows=true, cols=pred):\n", oof_metrics["confusion_matrix"])
+
+        # Fit final model across all usable samples for deployment/inference
+        all_indices = list(range(len(base_ds)))
+        full_labels = base_ds.labels
+        full_criterion = nn.CrossEntropyLoss(weight=compute_class_weights(full_labels, len(DEFAULT_CLASS_NAMES), device))
+        full_loader = DataLoader(
+            Subset(train_aug_ds, all_indices),
+            batch_size=min(batch_size, max(1, len(all_indices))),
+            shuffle=True,
+            drop_last=len(all_indices) > batch_size,
+        )
 
         final_model = StageDeathCNN(
-            in_channels=3,
-            class_names=DEFAULT_CLASS_NAMES,
-            backbone=backbone,
-            pretrained=pretrained,
+            num_classes=len(DEFAULT_CLASS_NAMES),
+            pretrained=True,
+            freeze_backbone=freeze_backbone,
+            unfreeze_layer4=unfreeze_layer4,
+            dropout_p=dropout_p,
         ).to(device)
-        dev_weights = _compute_class_weights(dev_labels, num_classes=num_classes, device=device)
-        final_criterion = nn.CrossEntropyLoss(weight=dev_weights, label_smoothing=0.05)
-        final_optimizer = _build_optimizer(final_model, lr=lr, weight_decay=3e-2)
-        final_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            final_optimizer, T_max=final_epochs, eta_min=lr * 0.05
+        final_optimizer = build_optimizer(final_model, head_lr=head_lr, backbone_lr=backbone_lr, weight_decay=weight_decay)
+
+        for _ in range(epochs):
+            train_one_epoch(final_model, full_loader, full_criterion, final_optimizer, device)
+
+        ckpt_path = save_dir / f"stage_death_cnn_logo_trial{t_idx}.pt"
+        torch.save(
+            {
+                "state_dict": final_model.state_dict(),
+                "config": cfg,
+                "oof_macro_f1": oof_metrics["macro_f1"],
+                "oof_accuracy": oof_metrics["accuracy"],
+            },
+            ckpt_path,
         )
 
-        for _ in range(1, final_epochs + 1):
-            final_model.train()
-            for images, labels in dev_loader:
-                images, labels = images.to(device), labels.to(device)
-                final_optimizer.zero_grad()
-                logits = final_model(images)
-                loss = final_criterion(logits, labels)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(final_model.parameters(), max_norm=2.0)
-                final_optimizer.step()
-            final_scheduler.step()
-    else:
-        final_model = model
+        score = float(oof_metrics["macro_f1"])
+        if score > best_score:
+            best_score = score
+            best_ckpt_path = ckpt_path
 
-    saved_state = {k: v.cpu().clone() for k, v in final_model.state_dict().items()}
-    torch.save(
-        {
-            "model_state_dict": saved_state,
-            "class_names": DEFAULT_CLASS_NAMES,
-            "backbone": backbone,
-            "best_val_acc": round(mean_cv_acc, 4),
-            "best_val_f1": round(max(mean_cv_f1, tuned_oof_f1), 4),
-            "mean_cv_acc": round(mean_cv_acc, 4),
-            "mean_cv_f1": round(mean_cv_f1, 4),
-            "tuned_oof_f1": round(tuned_oof_f1, 4),
-            "class_multipliers": tuned_multipliers,
-            "selected_indices": dev_indices,
-        },
-        checkpoint_path,
-    )
-    print(
-        f"\nSaved checkpoint (Mean CV Acc: {mean_cv_acc:.2%}, Mean CV Macro F1: {mean_cv_f1:.4f}, "
-        f"Tuned OOF Macro F1: {tuned_oof_f1:.4f}) to {checkpoint_path}"
-    )
-    return final_model
+    print(f"\nBest LOGO checkpoint: {best_ckpt_path} (OOF Macro F1: {best_score:.4f})")
 
-
-def model_predict(
-    frames_dir: Path | None = None,
-    checkpoint_path: Path = CHECKPOINT_PATH,
-    split: str = "all",  # "heldout", "train_dev", or "all"
-    seed: int = 42,
-    use_tuned_multipliers: bool = True,
-) -> tuple[list[dict[str, float | int | str]], dict[str, object]]:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    target_folder = frames_dir if frames_dir is not None else Path(__file__).resolve().parent / "data" / "features" / "filtered"
-    all_png_paths = sorted(target_folder.glob("*.png"))
-    if not all_png_paths:
-        raise FileNotFoundError(f"No .png files found in {target_folder}")
-
-    class_names = list(DEFAULT_CLASS_NAMES)
-    backbone = "resnet18"
-    state_dict = None
-    selected_indices: list[int] | None = None
-    class_multipliers: list[float] | None = None
-
-    if checkpoint_path.exists():
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            state_dict = checkpoint["model_state_dict"]
-            class_names = checkpoint.get("class_names", list(DEFAULT_CLASS_NAMES))
-            backbone = checkpoint.get("backbone", "resnet18")
-            selected_indices = checkpoint.get("selected_indices")
-            if use_tuned_multipliers:
-                class_multipliers = checkpoint.get("class_multipliers")
-        else:
-            state_dict = checkpoint
-
-    all_labels = [
-        class_names.index(extract_class_name_from_filename(p, allowed_classes=class_names))
-        for p in all_png_paths
-    ]
-    all_groups = [extract_cell_group_id_from_filename(p) for p in all_png_paths]
-    if selected_indices is None:
-        selected_indices = _select_stratified_indices(all_labels, group_ids=all_groups, fraction=0.85, seed=seed)
-
-    selected_set = set(selected_indices)
-    if split == "heldout":
-        target_indices = [i for i in range(len(all_png_paths)) if i not in selected_set]
-    elif split in {"train_dev", "train_half"}:
-        target_indices = [i for i in range(len(all_png_paths)) if i in selected_set]
-    elif split == "all":
-        target_indices = list(range(len(all_png_paths)))
-    else:
-        raise ValueError(f"Invalid split '{split}'. Expected 'heldout', 'train_dev', or 'all'.")
-
-    target_paths = [all_png_paths[i] for i in target_indices]
-    if not target_paths:
-        raise ValueError(f"No images found for split='{split}' in {target_folder}")
-
-    model = StageDeathCNN(
-        in_channels=3,
-        class_names=class_names,
-        backbone=backbone,
-        pretrained=False,
-    ).to(device)
-    if state_dict is not None:
-        model.load_state_dict(state_dict)
-
-    preprocess = transforms.Compose([
-        transforms.Resize(DEFAULT_IMAGE_SIZE),
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
-    tensors = []
-    for path in target_paths:
-        with Image.open(path) as img:
-            tensors.append(preprocess(img.convert("RGB")))
-    batch = torch.stack(tensors, dim=0).to(device)
-
-    print(f"Split '{split}' batch shape:", batch.shape)
-    predictions = model.predict(batch, class_multipliers=class_multipliers)
-
-    y_true: list[int] = []
-    y_pred: list[int] = []
-    for path, pred in zip(target_paths, predictions):
-        actual_class = extract_class_name_from_filename(path, allowed_classes=class_names)
-        actual_idx = class_names.index(actual_class)
-        pred_idx = int(pred["class_index"])
-        y_true.append(actual_idx)
-        y_pred.append(pred_idx)
-        print(f"{path.name} | actual: {actual_class} | pred: {pred}")
-
-    metrics = compute_classification_metrics(y_true, y_pred, class_names=class_names)
-    print_metrics_report(metrics, title=f"Split '{split}' Metrics")
-    return predictions, metrics
 
 if __name__ == "__main__":
-    hyperparam_configs = [
-        {"epochs": 25, "batch_size": 16, "lr": 1e-3, "train_fraction": 0.85, "n_splits": 3},
-        {"epochs": 30, "batch_size": 16, "lr": 1e-3, "train_fraction": 0.85, "n_splits": 3},
-        {"epochs": 25, "batch_size": 20, "lr": 1e-3, "train_fraction": 0.85, "n_splits": 3},
-        {"epochs": 25, "batch_size": 16, "lr": 1e-3, "train_fraction": 0.75, "n_splits": 3},
-        {"epochs": 25, "batch_size": 16, "lr": 1e-5, "train_fraction": 0.85, "n_splits": 3},
-        
+    trials_config = [
+        {"freeze_backbone": True, "unfreeze_layer4": False, "head_lr": 1e-3, "weight_decay": 1e-2, "dropout_p": 0.5},
+        {"freeze_backbone": True, "unfreeze_layer4": True, "head_lr": 1e-3, "backbone_lr": 1e-4, "weight_decay": 2e-2, "dropout_p": 0.5},
+        {"freeze_backbone": False, "unfreeze_layer4": True, "head_lr": 5e-4, "backbone_lr": 5e-5, "weight_decay": 5e-2, "dropout_p": 0.6},
+        {"freeze_backbone": False, "unfreeze_layer4": True, "head_lr": 5e-4, "backbone_lr": 5e-5, "weight_decay": 1e-2, "dropout_p": 0.6},
     ]
-
-    best_ckpt: Path | None = None
-    best_val_f1 = -1.0
-
-    for idx, cfg in enumerate(hyperparam_configs, start=1):
-        trial_ckpt = CHECKPOINT_PATH.with_name(
-            f"{CHECKPOINT_PATH.stem}_trial{idx}{CHECKPOINT_PATH.suffix}"
-        )
-        print(f"\n--- Running config {idx}/{len(hyperparam_configs)}: {cfg} ---")
-        model_train(
-            epochs=cfg["epochs"],
-            batch_size=cfg["batch_size"],
-            lr=cfg["lr"],
-            checkpoint_path=trial_ckpt,
-            train_fraction=cfg["train_fraction"],
-            n_splits=cfg["n_splits"],
-        )
-
-        ckpt_data = torch.load(trial_ckpt, map_location="cpu")
-        val_f1 = float(ckpt_data.get("best_val_f1", ckpt_data.get("best_val_acc", 0.0)))
-        print(f"Config {idx} best val F1: {val_f1:.4f}")
-
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            best_ckpt = trial_ckpt
-
-    print(f"\nBest checkpoint: {best_ckpt} (Val F1: {best_val_f1:.4f})")
-    model_predict(checkpoint_path=best_ckpt or CHECKPOINT_PATH, split="train_dev")
+    run_experiment(
+        data_dir=Path("{insert path here}"),
+        trials=trials_config,
+        n_splits=None,  # Set e.g. n_splits=5 for 5-fold group CV instead of full LOGO
+        epochs=25,
+        batch_size=8,
+        seed=42,
+        save_dir=Path("{insert path here}"),
+    )
